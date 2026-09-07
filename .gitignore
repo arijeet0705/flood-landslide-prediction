@@ -1,4 +1,6 @@
-*.pkl
-*.csv
+flood_model.pkl
+flood_training_data_100k.csv
+flood_training_data.csv
+missed_disasters_analysis.csv
 __pycache__/
 .DS_Store

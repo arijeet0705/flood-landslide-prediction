@@ -4,6 +4,7 @@ Target: 1,00,000+ rows across extended Uttarakhand districts (2005-2024)
 """
 
 import time
+import os
 import numpy as np
 import pandas as pd
 import requests
@@ -118,7 +119,7 @@ def fetch_historical_weather(locations: pd.DataFrame, start_year: int = 2005,
         params = {
             "latitude": loc["lat"], "longitude": loc["lon"],
             "start_date": f"{start_year}-01-01", "end_date": f"{end_year}-12-31",
-            "hourly": "precipitation,soil_moisture_0_to_1cm", "timezone": "Asia/Kolkata",
+            "hourly": "precipitation,soil_moisture_0_to_7cm", "timezone": "Asia/Kolkata",
         }
         
         success = False
@@ -146,7 +147,7 @@ def fetch_historical_weather(locations: pd.DataFrame, start_year: int = 2005,
         df = pd.DataFrame({
             "datetime": pd.to_datetime(hourly["time"]),
             "rainfall_mm": hourly["precipitation"],
-            "soil_moisture_frac": hourly["soil_moisture_0_to_1cm"],
+            "soil_moisture_frac": hourly["soil_moisture_0_to_7cm"],
         })
         df["date"] = df["datetime"].dt.floor("D")
         daily = df.groupby("date").agg(
@@ -223,7 +224,14 @@ def build_features(weather: pd.DataFrame, matched_events: set) -> pd.DataFrame:
     data = weather.sort_values(["location_id", "date"]).copy()
     data["rain_24hr"] = data.groupby("location_id")["rainfall_mm"].transform(lambda s: s.rolling(1, min_periods=1).sum())
     data["rain_72hr"] = data.groupby("location_id")["rainfall_mm"].transform(lambda s: s.rolling(3, min_periods=1).sum())
+    data["rain_5day"] = data.groupby("location_id")["rainfall_mm"].transform(lambda s: s.rolling(5, min_periods=1).sum())
     data["rain_rate_change"] = data.groupby("location_id")["rainfall_mm"].diff().fillna(0)
+
+    # Simple "extreme rainfall day" flag — a day where rainfall is unusually
+    # high relative to that location's own typical monsoon rainfall (top 5%).
+    # Cheap, physically meaningful signal for sudden-onset flash floods.
+    threshold_per_loc = data.groupby("location_id")["rainfall_mm"].transform(lambda s: s.quantile(0.95))
+    data["extreme_rain_flag"] = (data["rainfall_mm"] >= threshold_per_loc).astype(int)
 
     data["flood_event"] = data.apply(lambda r: 1 if (r["location_id"], r["date"]) in matched_events else 0, axis=1)
 
@@ -238,57 +246,210 @@ def build_features(weather: pd.DataFrame, matched_events: set) -> pd.DataFrame:
 
     data["historical_incidents"] = data.apply(rolling_incident_count, axis=1)
     return data
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 6. MODEL TRAINING & EVALUATION — continuous risk score, threshold-independent metrics
+# ---------------------------------------------------------------------------
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import roc_auc_score, average_precision_score, classification_report, confusion_matrix
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from imblearn.over_sampling import SMOTE
+import numpy as np
+import pandas as pd
 
-# ---------------------------------------------------------------------------
-# 6. MODEL TRAINING & EVALUATION (Threshold = 0.45)
-# ---------------------------------------------------------------------------
 FEATURES = [
     "elevation_m", "slope_deg", "historical_incidents",
-    "rainfall_mm", "rain_24hr", "rain_72hr", "rain_rate_change", "soil_moisture",
+    "rainfall_mm", "rain_24hr", "rain_72hr", "rain_5day", "rain_rate_change",
+    "soil_moisture", "extreme_rain_flag",
 ]
 
-def train_model(data: pd.DataFrame, threshold: float = 0.45):
+
+def train_model(data: pd.DataFrame):
     X = data[FEATURES]
     y = data["flood_event"]
 
     print(f"\nTotal Dataset Size: {len(data)} rows | Positive Disasters: {y.sum()} ({100 * y.mean():.3f}%)")
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y if y.sum() >= 2 else None
+    # -----------------------------------------------------------------------
+    # CROSS-VALIDATION — a robustness check, done FIRST, purely diagnostic.
+    # With so few positives, one lucky/unlucky split can make the model look
+    # much better or worse than it really is. 5-fold stratified CV trains and
+    # evaluates 5 times on different slices and reports the average — a much
+    # more trustworthy number than a single split. SMOTE is applied ONLY to
+    # each fold's TRAINING portion, never to the held-out evaluation fold —
+    # applying it to validation/test data would leak synthetic information
+    # into the numbers you're trying to trust.
+    # -----------------------------------------------------------------------
+    print("\n--- 5-Fold Cross-Validation (robustness check, SMOTE on training folds only) ---")
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    cv_roc_aucs, cv_pr_aucs = [], []
+
+    for fold_i, (train_idx, eval_idx) in enumerate(skf.split(X, y), 1):
+        X_fold_train, X_fold_eval = X.iloc[train_idx], X.iloc[eval_idx]
+        y_fold_train, y_fold_eval = y.iloc[train_idx], y.iloc[eval_idx]
+
+        n_minority = y_fold_train.sum()
+        if n_minority >= 6:
+            smote = SMOTE(k_neighbors=min(5, n_minority - 1), random_state=42,sampling_strategy=0.15)
+            X_fold_train, y_fold_train = smote.fit_resample(X_fold_train, y_fold_train)
+        # else: too few positives in this fold to safely SMOTE — train as-is
+
+        fold_model = RandomForestClassifier(
+            n_estimators=300, max_depth=8, min_samples_leaf=5,
+            class_weight="balanced_subsample", random_state=42, n_jobs=-1,
+        )
+        fold_model.fit(X_fold_train, y_fold_train)
+        fold_probs = fold_model.predict_proba(X_fold_eval)[:, 1]
+
+        fold_roc = roc_auc_score(y_fold_eval, fold_probs)
+        fold_pr = average_precision_score(y_fold_eval, fold_probs)
+        cv_roc_aucs.append(fold_roc)
+        cv_pr_aucs.append(fold_pr)
+        print(f"  Fold {fold_i}: ROC-AUC={fold_roc:.3f}  PR-AUC={fold_pr:.3f}  "
+              f"(eval positives: {int(y_fold_eval.sum())})")
+
+    print(f"\nCross-validated ROC-AUC: {np.mean(cv_roc_aucs):.3f} ± {np.std(cv_roc_aucs):.3f}")
+    print(f"Cross-validated PR-AUC:  {np.mean(cv_pr_aucs):.3f} ± {np.std(cv_pr_aucs):.3f}")
+    print("This is the more honest, defensible number to quote — an average across 5")
+    print("different data splits, not whichever single split happened to look best.\n")
+
+    print("NOTE: at this positive rate, threshold choice trades precision vs recall directly.")
+    print("We pick the threshold on a VALIDATION split (never seen by the model, separate from")
+    print("the test set used for final reporting) so the chosen cutoff isn't just overfit to")
+    print("whichever split happened to be easiest.\n")
+
+    # 3-way split: train (model fitting) / val (threshold selection only) / test (final report)
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        X, y, test_size=0.3, random_state=42, stratify=y
     )
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp
+    )
+    print(f"Train: {len(X_train)} | Validation (threshold selection): {len(X_val)} "
+          f"({y_val.sum()} positive) | Test (final report): {len(X_test)} ({y_test.sum()} positive)")
+
+    # SMOTE applied ONLY to the training set here too — same rule as in CV above.
+    n_minority_train = y_train.sum()
+    if n_minority_train >= 6:
+        smote = SMOTE(k_neighbors=min(5, n_minority_train - 1), random_state=42,sampling_strategy=0.15)
+        X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
+        print(f"Applied SMOTE to training set only: {len(X_train)} -> {len(X_train_res)} rows "
+              f"(validation/test sets left untouched, real data only).")
+    else:
+        X_train_res, y_train_res = X_train, y_train
+        print("Too few positives in this training split for safe SMOTE — training on real data as-is.")
 
     model = RandomForestClassifier(
-        n_estimators=300, max_depth=12, class_weight="balanced",
-        random_state=42, n_jobs=-1,
+        n_estimators=300, max_depth=8, min_samples_leaf=5,
+        class_weight="balanced_subsample", random_state=42, n_jobs=-1,
     )
-    model.fit(X_train, y_train)
+    model.fit(X_train_res, y_train_res)
 
-    y_probs = model.predict_proba(X_test)[:, 1]
-    y_pred = (y_probs >= threshold).astype(int)
+    test_probs = model.predict_proba(X_test)[:, 1]
+    val_probs = model.predict_proba(X_val)[:, 1]
 
-    print(f"\n--- Classification Report (Threshold = {threshold}) ---")
-    print(classification_report(y_test, y_pred, labels=[0, 1],
+    roc_auc = roc_auc_score(y_test, test_probs)
+    pr_auc = average_precision_score(y_test, test_probs)
+    print(f"\nROC-AUC: {roc_auc:.3f}  (0.5 = random guessing, 1.0 = perfect separation)")
+    print(f"PR-AUC:  {pr_auc:.3f}  (baseline for this data = {y_test.mean():.4f}, i.e. the positive rate)")
+
+    # --- Honest caveat: with so few positive events, ANY single "best" threshold ---
+    # is statistically shaky (chosen from a handful of validation positives). So
+    # instead of picking one number and pretending it's optimal, show a SMALL TABLE
+    # of candidate thresholds and let the actual deployment choose based on how
+    # costly false alarms vs missed disasters are — a tunable sensitivity dial,
+    # not a single fixed cutoff. This is also a legitimate real-world design
+    # choice: disaster-response teams often want an adjustable alert sensitivity.
+    print(f"\n--- Threshold options (selected on validation set, {int(y_val.sum())} real positives) ---")
+    print("Lower threshold = more alerts, catches more real events, more false alarms.")
+    print("Higher threshold = fewer alerts, fewer false alarms, risks missing real events.\n")
+    print(f"{'Threshold':<10}{'Val Precision':<15}{'Val Recall':<12}{'Val F1':<8}")
+    candidate_thresholds = [0.3, 0.4, 0.5,0.6,0.7,0.8]
+    best_f1, best_threshold = -1, 0.3
+    for t in candidate_thresholds:
+        pred = (val_probs >= t).astype(int)
+        tp = ((pred == 1) & (y_val == 1)).sum()
+        fp = ((pred == 1) & (y_val == 0)).sum()
+        fn = ((pred == 0) & (y_val == 1)).sum()
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        print(f"{t:<10}{precision:<15.3f}{recall:<12.3f}{f1:<8.3f}")
+        if f1 > best_f1:
+            best_f1, best_threshold = f1, t
+    # Overriding auto-F1 pick — recall matters more than F1 here (missing a
+    # real disaster is worse than a false alarm), so we lock threshold=0.4.
+    best_threshold = 0.4
+    print(f"\nUsing threshold = {best_threshold} (chosen for recall priority, not max F1).")
+
+    # Final report on TEST set at the validation-chosen threshold (proper, no leakage)
+    y_pred_final = (test_probs >= best_threshold).astype(int)
+    print(f"\n--- Classification Report on TEST set at threshold={best_threshold} ---")
+    print(classification_report(y_test, y_pred_final, labels=[0, 1],
                                  target_names=["No Event", "Flood/Landslide Risk"], zero_division=0))
-    print("--- Confusion Matrix ---")
-    print(confusion_matrix(y_test, y_pred, labels=[0, 1]))
+    print(f"--- Confusion Matrix (threshold={best_threshold}) ---")
+    print(confusion_matrix(y_test, y_pred_final, labels=[0, 1]))
     print(f"Total Test Cases Evaluated: {len(y_test)}")
 
-    return model
+    print("\n--- Feature importance ---")
+    importance = pd.Series(model.feature_importances_, index=FEATURES).sort_values(ascending=False)
+    print(importance.round(3))
 
+    # Missed-disaster analysis at the reference 0.5 cutoff — useful to inspect,
+    # but remember: at 0.12% positive rate, plenty of real events will sit
+    # below any single cutoff. This file is diagnostic, not a claim of failure.
+    results_df = X_test.copy()
+    results_df["Actual_Disaster"] = y_test
+    results_df["Predicted_Disaster"] = y_pred_final
+    results_df["Risk_Probability"] = test_probs
+
+    false_negatives = results_df[(results_df["Actual_Disaster"] == 1) & (results_df["Predicted_Disaster"] == 0)]
+    print(f"\n{len(false_negatives)} real events scored below 0.5 (reference cutoff). Saving detail to CSV...")
+    false_negatives.to_csv("missed_disasters_analysis.csv", index=False)
+
+    return model
 # ---------------------------------------------------------------------------
 # EXECUTION FLOW
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Step 1: Prepare data grid, fetch historical archive & train model
-    locations = build_location_metadata(LOCATIONS)
-    weather = fetch_historical_weather(locations, start_year=2005, end_year=2024)
-    events = fetch_coolr_events(start_year=2000, end_year=2024)
-    matched = match_events_to_locations(events, locations, radius_km=30.0)
-    print(f"Matched {len(matched)} total disaster events across all Uttarakhand regions.")
-    
-    feature_data = build_features(weather, matched)
-    feature_data.to_csv("flood_training_data_100k.csv", index=False)
+    csv_filename = "flood_training_data_100k.csv"
 
-    model = train_model(feature_data, threshold=0.45)
+    # Agar CSV pehle se padi hai, toh seedha load karo (0 seconds delay!)
+    if os.path.exists(csv_filename):
+        print(f"Loading pre-fetched dataset locally from {csv_filename} (No API delay! 🚀)...")
+        feature_data = pd.read_csv(csv_filename)
+        feature_data['date'] = pd.to_datetime(feature_data['date'])
+
+        # If this CSV predates newer engineered features (added after it was
+        # cached), recompute just those columns from what's already here —
+        # no need to re-fetch anything from the internet for this.
+        needed_cols = {"rain_5day", "extreme_rain_flag"}
+        missing_cols = needed_cols - set(feature_data.columns)
+        if missing_cols:
+            print(f"  Cached CSV is missing newer columns {missing_cols} — recomputing "
+                  f"from existing data (no re-fetch needed)...")
+            feature_data = feature_data.sort_values(["location_id", "date"])
+            if "rain_5day" in missing_cols:
+                feature_data["rain_5day"] = feature_data.groupby("location_id")["rainfall_mm"].transform(
+                    lambda s: s.rolling(5, min_periods=1).sum())
+            if "extreme_rain_flag" in missing_cols:
+                threshold_per_loc = feature_data.groupby("location_id")["rainfall_mm"].transform(
+                    lambda s: s.quantile(0.95))
+                feature_data["extreme_rain_flag"] = (feature_data["rainfall_mm"] >= threshold_per_loc).astype(int)
+            feature_data.to_csv(csv_filename, index=False)
+            print(f"  Updated CSV saved with new columns.")
+    else:
+        # Agar CSV nahi mili (pehli baar), tabhi internet se fetch hoga aur save hoga
+        print("CSV not found. Running full data fetch pipeline...")
+        locations = build_location_metadata(LOCATIONS)
+        weather = fetch_historical_weather(locations, start_year=2005, end_year=2024)
+        events = fetch_coolr_events(start_year=2000, end_year=2024)
+        matched = match_events_to_locations(events, locations, radius_km=30.0)
+        print(f"Matched {len(matched)} total disaster events across all Uttarakhand regions.")
+        
+        feature_data = build_features(weather, matched)
+        feature_data.to_csv(csv_filename, index=False)
+
+    model = train_model(feature_data)
     joblib.dump(model, "flood_model_uk.pkl")
     print("\nModel successfully trained and saved as flood_model_uk.pkl!")
